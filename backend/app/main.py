@@ -67,6 +67,17 @@ class ProcessResponse(BaseModel):
     title: str
 
 
+class TestJiraRequest(BaseModel):
+    jira_issue_key: str
+    message: str
+    title: str = ""
+    url: str = ""
+
+
+class TestJiraResponse(BaseModel):
+    jira_comment_id: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -79,7 +90,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def generate_outline_with_gemini(pdf_text: str) -> dict[str, str]:
     """Returns {"title": ..., "markdown": ...}"""
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = (
         "다음 PDF 내용을 분석하여 구조화된 Outline 문서를 작성해 주세요.\n"
         "응답은 반드시 아래 형식을 따르세요:\n\n"
@@ -123,30 +134,86 @@ async def create_outline_document(title: str, markdown: str) -> str:
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Outline API error: {resp.text}")
     data = resp.json()
-    return data["data"]["url"]
+    raw_url = data["data"]["url"]  # e.g. "/doc/..."
+
+    # raw_url이 상대경로인 경우 OUTLINE_API_URL의 origin(scheme+host)을 붙여 완전한 URL로 만든다
+    if raw_url.startswith("/"):
+        from urllib.parse import urlparse
+        parsed = urlparse(settings.outline_api_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        return f"{origin}{raw_url}"
+
+    return raw_url
 
 
-async def add_jira_comment(issue_key: str, document_url: str, title: str) -> str:
-    """Adds a comment to a Jira issue and returns the comment ID."""
+def _jira_auth_headers() -> dict[str, str]:
     token = base64.b64encode(
         f"{settings.jira_email}:{settings.jira_api_token}".encode()
     ).decode()
-    headers = {
-        "Authorization": f"Basic {token}",
-        "Content-Type": "application/json",
-    }
-    body = (
-        f"📄 *PDF → Outline 문서가 생성되었습니다.*\n\n"
-        f"*제목:* {title}\n"
-        f"*링크:* {document_url}"
-    )
-    payload = {"body": body}
-    url = f"{settings.jira_base_url}/rest/api/3/issue/{issue_key}/comment"
+    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+
+
+def _build_adf_body(message: str, title: str, url: str) -> dict:
+    """
+    ADF 구조:
+      📄 PDF → Outline 문서가 생성되었습니다.
+      제목: {title}
+      링크: {url}  ← link mark로 클릭 가능한 하이퍼링크
+    """
+    content = [
+        # 첫 번째 줄: 고정 헤더 메시지
+        {
+            "type": "paragraph",
+            "content": [{"type": "text", "text": message}],
+        },
+    ]
+
+    if title:
+        content.append({
+            "type": "paragraph",
+            "content": [
+                {"type": "text", "text": "제목: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": title},
+            ],
+        })
+
+    if url:
+        content.append({
+            "type": "paragraph",
+            "content": [
+                {"type": "text", "text": "링크: ", "marks": [{"type": "strong"}]},
+                {
+                    "type": "text",
+                    "text": url,
+                    "marks": [{"type": "link", "attrs": {"href": url}}],
+                },
+            ],
+        })
+
+    return {"type": "doc", "version": 1, "content": content}
+
+
+async def _post_jira_comment(issue_key: str, body: str, title: str = "", url: str = "") -> str:
+    """Posts a comment to a Jira issue in ADF format and returns the comment ID."""
+    adf_body = _build_adf_body(body, title, url)
+    jira_url = f"{settings.jira_base_url}/rest/api/3/issue/{issue_key}/comment"
     async with httpx.AsyncClient() as client:
-        resp = await client.post(url, json=payload, headers=headers, timeout=30)
+        resp = await client.post(
+            jira_url, json={"body": adf_body}, headers=_jira_auth_headers(), timeout=30
+        )
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail=f"Jira API error: {resp.text}")
     return resp.json()["id"]
+
+
+async def add_jira_comment(issue_key: str, document_url: str, title: str) -> str:
+    """Adds a document-link comment to a Jira issue and returns the comment ID."""
+    return await _post_jira_comment(
+        issue_key,
+        body="📄 PDF → Outline 문서가 생성되었습니다.",
+        title=title,
+        url=document_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +223,32 @@ async def add_jira_comment(issue_key: str, document_url: str, title: str) -> str
 @app.get("/health", tags=["Health"])
 def health_check():
     return {"status": "ok", "version": app.version}
+
+
+@app.post("/test-jira", response_model=TestJiraResponse, tags=["Test"])
+async def test_jira(req: TestJiraRequest):
+    """Jira 연동만 단독으로 테스트합니다. Gemini·Outline 없이 지정 이슈에 댓글을 등록합니다."""
+    comment_id = await _post_jira_comment(req.jira_issue_key, req.message, req.title, req.url)
+    return TestJiraResponse(jira_comment_id=comment_id)
+
+
+@app.post("/process-mock", response_model=ProcessResponse, tags=["Test"])
+async def process_pdf_mock(
+    file: UploadFile = File(..., description="업로드할 PDF 파일"),
+    jira_issue_key: str = Form(..., description="댓글을 달 Jira 이슈 키 (예: PROJ-123)"),
+):
+    """PDF 파싱·Gemini 없이 Mock 데이터로 Outline 문서 생성 및 Jira 댓글 등록을 테스트합니다."""
+    title = f"테스트 문서 - {file.filename}"
+    markdown = "## 테스트\n이것은 Mock 테스트입니다."
+
+    document_url = await create_outline_document(title, markdown)
+    comment_id = await add_jira_comment(jira_issue_key, document_url, title)
+
+    return ProcessResponse(
+        outline_document_url=document_url,
+        jira_comment_id=comment_id,
+        title=title,
+    )
 
 
 @app.post("/process", response_model=ProcessResponse, tags=["PDF Processing"])

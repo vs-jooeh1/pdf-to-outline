@@ -82,6 +82,11 @@ class ProcessResponse(BaseModel):
     token_usage: TokenUsage | None = None
 
 
+class CollectionItem(BaseModel):
+    id: str
+    name: str
+
+
 class TestJiraRequest(BaseModel):
     jira_issue_key: str
     message: str
@@ -141,7 +146,7 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
     return {"title": title, "markdown": body, "token_usage": token_usage}
 
 
-async def create_outline_document(title: str, markdown: str) -> str:
+async def create_outline_document(title: str, markdown: str, collection_id: str | None = None) -> str:
     """Creates a document in Outline and returns its public URL."""
     headers = {
         "Authorization": f"Bearer {settings.outline_api_key}",
@@ -150,7 +155,7 @@ async def create_outline_document(title: str, markdown: str) -> str:
     payload = {
         "title": title,
         "text": markdown,
-        "collectionId": settings.outline_collection_id,
+        "collectionId": collection_id or settings.outline_collection_id,
         "publish": True,
     }
     async with httpx.AsyncClient() as client:
@@ -254,6 +259,29 @@ def health_check():
     return {"status": "ok", "version": app.version}
 
 
+@app.get("/collections", response_model=list[CollectionItem], tags=["Outline"])
+async def get_collections():
+    """Outline의 컬렉션 목록을 반환합니다."""
+    headers = {
+        "Authorization": f"Bearer {settings.outline_api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{settings.outline_api_url}/collections.list",
+            json={"limit": 100},
+            headers=headers,
+            timeout=15,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Outline API error: {resp.text}")
+    data = resp.json()
+    return [
+        CollectionItem(id=c["id"], name=c["name"])
+        for c in data.get("data", [])
+    ]
+
+
 @app.post("/test-jira", response_model=TestJiraResponse, tags=["Test"])
 async def test_jira(req: TestJiraRequest):
     """Jira 연동만 단독으로 테스트합니다. Gemini·Outline 없이 지정 이슈에 댓글을 등록합니다."""
@@ -265,12 +293,13 @@ async def test_jira(req: TestJiraRequest):
 async def process_pdf_mock(
     file: UploadFile = File(..., description="업로드할 PDF 파일"),
     jira_issue_key: str = Form(..., description="댓글을 달 Jira 이슈 키 (예: PROJ-123)"),
+    collection_id: str | None = Form(None, description="Outline 컬렉션 ID (미입력 시 기본값 사용)"),
 ):
     """PDF 파싱·Gemini 없이 Mock 데이터로 Outline 문서 생성 및 Jira 댓글 등록을 테스트합니다."""
     title = f"테스트 문서 - {file.filename}"
     markdown = "## 테스트\n이것은 Mock 테스트입니다."
 
-    document_url = await create_outline_document(title, markdown)
+    document_url = await create_outline_document(title, markdown, collection_id)
     comment_id = await add_jira_comment(jira_issue_key, document_url, title)
 
     return ProcessResponse(

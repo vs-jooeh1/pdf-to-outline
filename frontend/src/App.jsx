@@ -1,4 +1,4 @@
-import { useState, useRef, Fragment } from "react";
+import { useState, useRef, useEffect, Fragment } from "react";
 
 const API_URL = "http://127.0.0.1:8000/process-mock";
 
@@ -235,7 +235,21 @@ export default function App() {
   const [loadingStep, setLoadingStep] = useState(1);
   const [result, setResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [collections, setCollections] = useState([]);
+  const [collectionId, setCollectionId] = useState("");
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    fetch("http://127.0.0.1:8000/collections")
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setCollections(data);
+          if (data.length > 0) setCollectionId(data[0].id);
+        }
+      })
+      .catch(() => {}); // 컬렉션 로드 실패는 조용히 무시
+  }, []);
 
   const activeStep =
     status === STATUS.SUCCESS ? 5
@@ -263,6 +277,7 @@ export default function App() {
     const formData = new FormData();
     formData.append("file", file);
     formData.append("jira_issue_key", jiraKey.trim());
+    if (collectionId) formData.append("collection_id", collectionId);
 
     try {
       // 2단계: AI 분석
@@ -408,6 +423,40 @@ export default function App() {
                         <p className="text-xs text-gray-400">PDF 형식만 지원합니다</p>
                       </div>
                     )}
+                  </div>
+                </div>
+
+                {/* Collection 선택 */}
+                <div>
+                  <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                    Outline Collection
+                  </label>
+                  <div className="relative">
+                    <svg className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-indigo-400 pointer-events-none"
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                        d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                    <select
+                      value={collectionId}
+                      onChange={(e) => setCollectionId(e.target.value)}
+                      disabled={collections.length === 0}
+                      className="w-full rounded-xl border border-gray-200 bg-white/80 pl-10 pr-4 py-3 text-sm
+                        text-gray-800 font-medium appearance-none
+                        focus:outline-none focus:ring-2 focus:ring-indigo-400/50 focus:border-indigo-300
+                        disabled:text-gray-400 transition-all duration-200"
+                    >
+                      {collections.length === 0
+                        ? <option value="">컬렉션 불러오는 중...</option>
+                        : collections.map((c) => (
+                            <option key={c.id} value={c.id}>{c.name}</option>
+                          ))
+                      }
+                    </select>
+                    <svg className="absolute right-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none"
+                      fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
                   </div>
                 </div>
 

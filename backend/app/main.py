@@ -1,6 +1,9 @@
 import io
 import base64
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import pdfplumber
 import google.generativeai as genai
@@ -61,10 +64,17 @@ class ProcessRequest(BaseModel):
     jira_issue_key: str  # e.g. "PROJ-123"
 
 
+class TokenUsage(BaseModel):
+    prompt_token_count: int
+    candidates_token_count: int
+    total_token_count: int
+
+
 class ProcessResponse(BaseModel):
     outline_document_url: str
     jira_comment_id: str
     title: str
+    token_usage: TokenUsage | None = None
 
 
 class TestJiraRequest(BaseModel):
@@ -88,8 +98,8 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
-def generate_outline_with_gemini(pdf_text: str) -> dict[str, str]:
-    """Returns {"title": ..., "markdown": ...}"""
+def generate_outline_with_gemini(pdf_text: str) -> dict:
+    """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
     model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = (
         "다음 PDF 내용을 분석하여 구조화된 Outline 문서를 작성해 주세요.\n"
@@ -109,7 +119,21 @@ def generate_outline_with_gemini(pdf_text: str) -> dict[str, str]:
         title = first_line.removeprefix("TITLE:").strip()
         body = rest.strip()
 
-    return {"title": title, "markdown": body}
+    # 토큰 사용량 추출 및 로깅
+    usage = response.usage_metadata
+    token_usage = TokenUsage(
+        prompt_token_count=usage.prompt_token_count,
+        candidates_token_count=usage.candidates_token_count,
+        total_token_count=usage.total_token_count,
+    )
+    logger.info(
+        "Gemini token usage — prompt: %d, candidates: %d, total: %d",
+        token_usage.prompt_token_count,
+        token_usage.candidates_token_count,
+        token_usage.total_token_count,
+    )
+
+    return {"title": title, "markdown": body, "token_usage": token_usage}
 
 
 async def create_outline_document(title: str, markdown: str) -> str:
@@ -286,4 +310,5 @@ async def process_pdf(
         outline_document_url=document_url,
         jira_comment_id=comment_id,
         title=result["title"],
+        token_usage=result["token_usage"],
     )

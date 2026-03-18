@@ -1,7 +1,9 @@
 import io
+import re
 import base64
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,7 @@ class Settings(BaseSettings):
     jira_base_url: str
     jira_email: str
     jira_api_token: str
+    figma_access_token: str
     cors_origins: str = "http://localhost:3000"
 
     class Config:
@@ -87,6 +90,12 @@ class CollectionItem(BaseModel):
     name: str
 
 
+class FigmaProcessRequest(BaseModel):
+    figma_url: str
+    jira_issue_key: str
+    collection_id: str | None = None
+
+
 class TestJiraRequest(BaseModel):
     jira_issue_key: str
     message: str
@@ -102,6 +111,59 @@ class TestJiraResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def extract_figma_file_key(figma_url: str) -> str:
+    """Figma URL에서 file key를 추출합니다.
+    지원 형식:
+      https://www.figma.com/file/XXXXXX/...
+      https://www.figma.com/design/XXXXXX/...
+    """
+    match = re.search(r"figma\.com/(?:file|design)/([A-Za-z0-9]+)", figma_url)
+    if not match:
+        raise ValueError(f"유효한 Figma URL이 아닙니다: {figma_url}")
+    return match.group(1)
+
+
+async def fetch_figma_file(file_key: str) -> dict:
+    """Figma REST API로 파일 데이터를 가져옵니다."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://api.figma.com/v1/files/{file_key}",
+            headers={"X-Figma-Token": settings.figma_access_token},
+            timeout=30,
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Figma API error: {resp.text}")
+    return resp.json()
+
+
+def extract_figma_text(figma_data: dict) -> str:
+    """Figma 파일 데이터에서 페이지명, 프레임명, 텍스트 노드를 추출합니다."""
+    lines: list[str] = []
+
+    def _walk(node: dict, depth: int = 0) -> None:
+        node_type = node.get("type", "")
+        name = node.get("name", "").strip()
+
+        if node_type == "CANVAS":          # 페이지
+            lines.append(f"\n[페이지] {name}")
+        elif node_type == "FRAME":         # 프레임
+            prefix = "  " * depth
+            lines.append(f"{prefix}[프레임] {name}")
+        elif node_type == "TEXT":          # 텍스트 노드
+            chars = node.get("characters", "").strip()
+            if chars:
+                prefix = "  " * depth
+                lines.append(f"{prefix}- {chars}")
+
+        for child in node.get("children", []):
+            _walk(child, depth + 1)
+
+    for page in figma_data.get("document", {}).get("children", []):
+        _walk(page)
+
+    return "\n".join(lines)
+
+
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         pages = [page.extract_text() or "" for page in pdf.pages]
@@ -112,10 +174,16 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
     """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
     model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = (
-        "다음 PDF 내용을 분석하여 구조화된 Outline 문서를 작성해 주세요.\n"
+        "아래 PDF 내용을 분석하여 개발자가 바로 이해할 수 있는 한국어 문서를 작성해 주세요.\n"
+        "불필요한 내용은 제거하고 핵심만 명확하게 정리하세요.\n\n"
         "응답은 반드시 아래 형식을 따르세요:\n\n"
-        "TITLE: <문서 제목>\n\n"
-        "<마크다운 본문>\n\n"
+        "TITLE: <PDF 내용 기반으로 자동 생성한 문서 제목>\n\n"
+        "## 문서 개요\n"
+        "<전체 내용을 2~3줄로 요약>\n\n"
+        "## 주요 내용\n"
+        "<핵심 내용을 의미 단위 섹션(### 소제목)으로 나눠 정리>\n\n"
+        "## 참고사항\n"
+        "<기타 메모, 제약사항, 주의할 점 등 — 없으면 이 섹션은 생략>\n\n"
         "---\n"
         f"{pdf_text[:12000]}"
     )
@@ -172,7 +240,6 @@ async def create_outline_document(title: str, markdown: str, collection_id: str 
 
     # raw_url이 상대경로인 경우 OUTLINE_API_URL의 origin(scheme+host)을 붙여 완전한 URL로 만든다
     if raw_url.startswith("/"):
-        from urllib.parse import urlparse
         parsed = urlparse(settings.outline_api_url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
         return f"{origin}{raw_url}"
@@ -240,11 +307,16 @@ async def _post_jira_comment(issue_key: str, body: str, title: str = "", url: st
     return resp.json()["id"]
 
 
-async def add_jira_comment(issue_key: str, document_url: str, title: str) -> str:
+async def add_jira_comment(
+    issue_key: str,
+    document_url: str,
+    title: str,
+    header: str = "📄 PDF → Outline 문서가 생성되었습니다.",
+) -> str:
     """Adds a document-link comment to a Jira issue and returns the comment ID."""
     return await _post_jira_comment(
         issue_key,
-        body="📄 PDF → Outline 문서가 생성되었습니다.",
+        body=header,
         title=title,
         url=document_url,
     )
@@ -287,6 +359,86 @@ async def test_jira(req: TestJiraRequest):
     """Jira 연동만 단독으로 테스트합니다. Gemini·Outline 없이 지정 이슈에 댓글을 등록합니다."""
     comment_id = await _post_jira_comment(req.jira_issue_key, req.message, req.title, req.url)
     return TestJiraResponse(jira_comment_id=comment_id)
+
+
+@app.post("/process-figma", response_model=ProcessResponse, tags=["Figma"])
+async def process_figma(req: FigmaProcessRequest):
+    """Figma 파일을 분석해 Outline 문서를 생성하고 Jira 이슈에 댓글을 등록합니다."""
+    # 1. Figma file key 추출
+    try:
+        file_key = extract_figma_file_key(req.figma_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 2. Figma API로 파일 데이터 조회
+    figma_data = await fetch_figma_file(file_key)
+
+    # 3. 텍스트 추출
+    figma_text = extract_figma_text(figma_data)
+    if not figma_text.strip():
+        raise HTTPException(status_code=422, detail="Figma 파일에서 텍스트를 추출할 수 없습니다.")
+
+    # 4. Gemini로 Outline 마크다운 생성
+    try:
+        result = generate_outline_with_gemini(figma_text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini API 오류: {e}")
+
+    # 5. Outline 문서 생성
+    document_url = await create_outline_document(result["title"], result["markdown"], req.collection_id)
+
+    # 6. Jira 댓글 등록
+    comment_id = await add_jira_comment(
+        req.jira_issue_key, document_url, result["title"],
+        header="🎨 Figma → Outline 문서가 생성되었습니다.",
+    )
+
+    return ProcessResponse(
+        outline_document_url=document_url,
+        jira_comment_id=comment_id,
+        title=result["title"],
+        token_usage=result["token_usage"],
+    )
+
+
+@app.post("/process-figma-mock", response_model=ProcessResponse, tags=["Test"])
+async def process_figma_mock(req: FigmaProcessRequest):
+    """Figma API로 파일 정보를 가져오되 Gemini 없이 Mock 마크다운으로 Outline·Jira를 테스트합니다."""
+    # 1. Figma file key 추출
+    try:
+        file_key = extract_figma_file_key(req.figma_url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 2. Figma API 실제 호출
+    figma_data = await fetch_figma_file(file_key)
+
+    # 3. 파일명 + 페이지명 추출
+    figma_file_name = figma_data.get("name", file_key)
+    page_names = ", ".join(
+        page.get("name", "")
+        for page in figma_data.get("document", {}).get("children", [])
+        if page.get("name")
+    ) or "없음"
+
+    title = f"[Figma] {figma_file_name}"
+    markdown = f"## Figma 문서\n파일명: {figma_file_name}\n페이지: {page_names}"
+
+    # 4. Outline 문서 생성
+    document_url = await create_outline_document(title, markdown, req.collection_id)
+
+    # 5. Jira 댓글 등록
+    comment_id = await add_jira_comment(
+        req.jira_issue_key, document_url, title,
+        header="🎨 Figma → Outline 문서가 생성되었습니다.",
+    )
+
+    return ProcessResponse(
+        outline_document_url=document_url,
+        jira_comment_id=comment_id,
+        title=title,
+        token_usage=None,
+    )
 
 
 @app.post("/process-mock", response_model=ProcessResponse, tags=["Test"])

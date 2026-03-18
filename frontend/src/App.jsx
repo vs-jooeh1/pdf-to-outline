@@ -1,22 +1,31 @@
 import { useState, useRef, useEffect, Fragment } from "react";
 
-const API_URL = "http://127.0.0.1:8000/process-mock";
+const BASE_URL = "http://127.0.0.1:8000";
 
 const STATUS = { IDLE: "idle", LOADING: "loading", SUCCESS: "success", ERROR: "error" };
+const TAB = { PDF: "pdf", FIGMA: "figma" };
 
 const STEPS = [
-  { id: 1, label: "PDF 업로드" },
+  { id: 1, label: "소스 업로드" },
   { id: 2, label: "AI 분석" },
   { id: 3, label: "문서 생성" },
   { id: 4, label: "Jira 등록" },
 ];
 
-const LOADING_MESSAGES = [
-  "PDF를 분석하고 있어요...",
-  "AI가 문서를 생성하고 있어요...",
-  "Outline에 업로드하는 중...",
-  "Jira에 등록하는 중...",
-];
+const LOADING_MESSAGES = {
+  [TAB.PDF]: [
+    "PDF를 분석하고 있어요...",
+    "AI가 문서를 생성하고 있어요...",
+    "Outline에 업로드하는 중...",
+    "Jira에 등록하는 중...",
+  ],
+  [TAB.FIGMA]: [
+    "Figma 파일을 불러오는 중...",
+    "AI가 문서를 생성하고 있어요...",
+    "Outline에 업로드하는 중...",
+    "Jira에 등록하는 중...",
+  ],
+};
 
 // ─── 아이콘 ────────────────────────────────────────────────────────────────
 
@@ -122,8 +131,9 @@ function StepBar({ activeStep }) {
 
 // ─── 로딩 오버레이 ─────────────────────────────────────────────────────────
 
-function LoadingOverlay({ step }) {
-  const msg = LOADING_MESSAGES[Math.min(step - 1, LOADING_MESSAGES.length - 1)];
+function LoadingOverlay({ step, tab }) {
+  const msgs = LOADING_MESSAGES[tab] ?? LOADING_MESSAGES[TAB.PDF];
+  const msg = msgs[Math.min(step - 1, msgs.length - 1)];
   return (
     <div className="flex flex-col items-center justify-center gap-5 py-10">
       {/* 스피너 */}
@@ -228,7 +238,9 @@ function SuccessScreen({ result, jiraKey, onReset }) {
 // ─── 메인 앱 ───────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [tab, setTab] = useState(TAB.PDF);
   const [file, setFile] = useState(null);
+  const [figmaUrl, setFigmaUrl] = useState("");
   const [jiraKey, setJiraKey] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [status, setStatus] = useState(STATUS.IDLE);
@@ -265,24 +277,39 @@ export default function App() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!file || !jiraKey.trim()) return;
+
+    const isPdf = tab === TAB.PDF;
+    if (isPdf && !file) return;
+    if (!isPdf && !figmaUrl.trim()) return;
+    if (!jiraKey.trim()) return;
 
     setResult(null);
     setErrorMsg("");
-
-    // 1단계: PDF 업로드
     setStatus(STATUS.LOADING);
     setLoadingStep(1);
 
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("jira_issue_key", jiraKey.trim());
-    if (collectionId) formData.append("collection_id", collectionId);
-
     try {
-      // 2단계: AI 분석
+      // 2단계: AI 분석 요청
       setLoadingStep(2);
-      const res = await fetch(API_URL, { method: "POST", body: formData });
+
+      let res;
+      if (isPdf) {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("jira_issue_key", jiraKey.trim());
+        if (collectionId) formData.append("collection_id", collectionId);
+        res = await fetch(`${BASE_URL}/process-mock`, { method: "POST", body: formData });
+      } else {
+        res = await fetch(`${BASE_URL}/process-figma`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            figma_url: figmaUrl.trim(),
+            jira_issue_key: jiraKey.trim(),
+            collection_id: collectionId || null,
+          }),
+        });
+      }
 
       // 3단계: 문서 생성 (응답 수신)
       setLoadingStep(3);
@@ -311,6 +338,7 @@ export default function App() {
 
   const reset = () => {
     setFile(null);
+    setFigmaUrl("");
     setJiraKey("");
     setStatus(STATUS.IDLE);
     setResult(null);
@@ -319,7 +347,8 @@ export default function App() {
   };
 
   const isLoading = status === STATUS.LOADING;
-  const canSubmit = !!file && jiraKey.trim().length > 0 && !isLoading;
+  const canSubmit = !isLoading && jiraKey.trim().length > 0 &&
+    (tab === TAB.PDF ? !!file : figmaUrl.trim().length > 0);
 
   return (
     <div className="min-h-screen w-full flex flex-col"
@@ -348,10 +377,10 @@ export default function App() {
 
             {/* 제목 */}
             {status !== STATUS.SUCCESS && (
-              <div className="mb-7 text-center">
+              <div className="mb-6 text-center">
                 <h1 className="text-3xl font-bold text-gray-900 tracking-tight">PDF to Outline</h1>
                 <p className="mt-1 text-xs text-gray-400">
-                  PDF를 업로드하면 Outline 문서를 생성하고 <br></br>Jira 이슈에 링크를 등록합니다.
+                  문서를 업로드하면 Outline 문서를 생성하고 Jira 이슈에 링크를 등록합니다.
                 </p>
               </div>
             )}
@@ -361,7 +390,7 @@ export default function App() {
 
             {/* ── 로딩 상태 ── */}
             {isLoading ? (
-              <LoadingOverlay step={loadingStep} />
+              <LoadingOverlay step={loadingStep} tab={tab} />
             ) : status === STATUS.SUCCESS ? (
               /* ── 성공 화면 ── */
               <SuccessScreen result={result} jiraKey={jiraKey} onReset={reset} />
@@ -369,7 +398,51 @@ export default function App() {
               /* ── 폼 ── */
               <form onSubmit={handleSubmit} className="space-y-4">
 
-                {/* PDF 드롭존 */}
+                {/* 탭 */}
+                <div className="flex rounded-xl bg-gray-100/80 p-1 gap-1">
+                  {[
+                    { key: TAB.PDF, label: "PDF 업로드" },
+                    { key: TAB.FIGMA, label: "Figma 링크" },
+                  ].map(({ key, label }) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => { setTab(key); setErrorMsg(""); }}
+                      className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all duration-200
+                        ${tab === key
+                          ? "bg-white text-indigo-600 shadow-sm"
+                          : "text-gray-500 hover:text-gray-700"}`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* ── PDF 탭 ── */}
+                {tab === TAB.FIGMA ? (
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                      Figma URL
+                    </label>
+                    <div className="relative">
+                      <svg className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-violet-400 pointer-events-none"
+                        fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                          d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                      </svg>
+                      <input
+                        type="url"
+                        value={figmaUrl}
+                        onChange={(e) => setFigmaUrl(e.target.value)}
+                        placeholder="https://www.figma.com/design/..."
+                        className="w-full rounded-xl border border-gray-200 bg-white/80 pl-10 pr-4 py-3 text-sm
+                          text-gray-800 placeholder-gray-300
+                          focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:border-violet-300
+                          transition-all duration-200"
+                      />
+                    </div>
+                  </div>
+                ) : (
                 <div>
                   <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
                     PDF 파일
@@ -425,6 +498,7 @@ export default function App() {
                     )}
                   </div>
                 </div>
+                )}
 
                 {/* Collection 선택 */}
                 <div>

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, Fragment } from "react";
+import { useState, useRef, Fragment } from "react";
 
 const API_URL = "http://127.0.0.1:8000/process-mock";
 
@@ -236,18 +236,6 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
   const fileInputRef = useRef(null);
-  const timerRef = useRef(null);
-
-  // 로딩 중 단계 메시지 순환
-  useEffect(() => {
-    if (status === STATUS.LOADING) {
-      setLoadingStep(1);
-      timerRef.current = setInterval(() => {
-        setLoadingStep((s) => Math.min(s + 1, STEPS.length));
-      }, 2200);
-    }
-    return () => clearInterval(timerRef.current);
-  }, [status]);
 
   const activeStep =
     status === STATUS.SUCCESS ? 5
@@ -265,22 +253,43 @@ export default function App() {
     e.preventDefault();
     if (!file || !jiraKey.trim()) return;
 
-    setStatus(STATUS.LOADING);
     setResult(null);
     setErrorMsg("");
+
+    // 1단계: PDF 업로드
+    setStatus(STATUS.LOADING);
+    setLoadingStep(1);
 
     const formData = new FormData();
     formData.append("file", file);
     formData.append("jira_issue_key", jiraKey.trim());
 
     try {
+      // 2단계: AI 분석
+      setLoadingStep(2);
       const res = await fetch(API_URL, { method: "POST", body: formData });
-      const data = await res.json();
+
+      // 3단계: 문서 생성 (응답 수신)
+      setLoadingStep(3);
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error("서버 응답을 파싱할 수 없습니다.");
+      }
       if (!res.ok) throw new Error(data.detail ?? "알 수 없는 오류가 발생했습니다.");
+
+      // 4단계: Jira 등록
+      setLoadingStep(4);
+      await new Promise((r) => setTimeout(r, 500));
+
       setResult(data);
       setStatus(STATUS.SUCCESS);
     } catch (err) {
-      setErrorMsg(err.message);
+      const msg = err.message === "Failed to fetch"
+        ? "서버에 연결할 수 없습니다. 백엔드가 실행 중인지 확인해주세요."
+        : err.message;
+      setErrorMsg(msg);
       setStatus(STATUS.ERROR);
     }
   };
@@ -327,7 +336,7 @@ export default function App() {
               <div className="mb-7 text-center">
                 <h1 className="text-3xl font-bold text-gray-900 tracking-tight">PDF to Outline</h1>
                 <p className="mt-1 text-xs text-gray-400">
-                  PDF를 업로드하면 Outline 문서를 생성하고 Jira 이슈에 링크를 등록합니다.
+                  PDF를 업로드하면 Outline 문서를 생성하고 <br></br>Jira 이슈에 링크를 등록합니다.
                 </p>
               </div>
             )}
@@ -452,7 +461,7 @@ export default function App() {
 
           {/* 카드 하단 설명 */}
           {status === STATUS.IDLE && (
-            <p className="text-center text-xs text-gray-400 mt-4">
+            <p className="text-center text-xs text-gray-400 mt-4"><br></br>
               PDF → Gemini AI 분석 → Outline 문서 → Jira 댓글
             </p>
           )}

@@ -538,6 +538,7 @@ async def process_pdf_mock(
 async def process_pdf(
     file: UploadFile = File(..., description="업로드할 PDF 파일"),
     jira_issue_key: str = Form(..., description="댓글을 달 Jira 이슈 키 (예: PROJ-123)"),
+    collection_id: str | None = Form(None, description="Outline 컬렉션 ID (미입력 시 기본값 사용)"),
 ):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
@@ -571,7 +572,7 @@ async def process_pdf(
         record_token_usage(u.total_token_count)
 
     # 3. Outline 문서 생성
-    document_url = await create_outline_document(result["title"], result["markdown"])
+    document_url = await create_outline_document(result["title"], result["markdown"], collection_id)
 
     # 4. Jira 댓글 등록
     comment_id = await add_jira_comment(jira_issue_key, document_url, result["title"])

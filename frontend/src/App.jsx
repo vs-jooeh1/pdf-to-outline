@@ -204,7 +204,7 @@ function SuccessScreen({ result, jiraKey, onReset }) {
           Outline 열기
         </a>
         <a
-          href={`https://jira.atlassian.com/browse/${jiraKey}`}
+          href={`${import.meta.env.VITE_JIRA_BASE_URL}/browse/${jiraKey}`}
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center justify-center gap-2 rounded-xl bg-white border border-gray-200

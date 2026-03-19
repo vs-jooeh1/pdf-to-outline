@@ -44,7 +44,8 @@ def record_token_usage(total_tokens: int) -> None:
         _save_token_usage(data)
 
 import pdfplumber
-import google.generativeai as genai
+# import google.generativeai as genai
+from groq import Groq
 import httpx
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,7 +58,8 @@ from pydantic_settings import BaseSettings
 # ---------------------------------------------------------------------------
 
 class Settings(BaseSettings):
-    gemini_api_key: str
+    # gemini_api_key: str
+    groq_api_key: str
     outline_api_url: str
     outline_api_key: str
     outline_collection_id: str
@@ -73,7 +75,8 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-genai.configure(api_key=settings.gemini_api_key)
+# genai.configure(api_key=settings.gemini_api_key)
+groq_client = Groq(api_key=settings.groq_api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +220,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def generate_outline_with_gemini(pdf_text: str) -> dict:
     """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
-    model = genai.GenerativeModel("gemini-2.0-flash-lite")
     prompt = (
         "아래 PDF 내용을 분석하여 개발자가 바로 이해할 수 있는 한국어 문서를 작성해 주세요.\n"
         "불필요한 내용은 제거하고 핵심만 명확하게 정리하세요.\n\n"
@@ -232,8 +234,11 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
         "---\n"
         f"{pdf_text[:12000]}"
     )
-    response = model.generate_content(prompt)
-    raw = response.text.strip()
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.choices[0].message.content.strip()
 
     title = "Untitled Document"
     body = raw
@@ -243,14 +248,14 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
         body = rest.strip()
 
     # 토큰 사용량 추출 및 로깅
-    usage = response.usage_metadata
+    usage = response.usage
     token_usage = TokenUsage(
-        prompt_token_count=usage.prompt_token_count,
-        candidates_token_count=usage.candidates_token_count,
-        total_token_count=usage.total_token_count,
+        prompt_token_count=usage.prompt_tokens,
+        candidates_token_count=usage.completion_tokens,
+        total_token_count=usage.total_tokens,
     )
     logger.info(
-        "Gemini token usage — prompt: %d, candidates: %d, total: %d",
+        "Groq token usage — prompt: %d, candidates: %d, total: %d",
         token_usage.prompt_token_count,
         token_usage.candidates_token_count,
         token_usage.total_token_count,
@@ -449,7 +454,7 @@ async def process_figma(req: FigmaProcessRequest):
     try:
         result = generate_outline_with_gemini(figma_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini API 오류: {e}")
+        raise HTTPException(status_code=502, detail=f"Groq API 오류: {e}")
 
     # 5. Outline 문서 생성
     document_url = await create_outline_document(result["title"], result["markdown"], req.collection_id)
@@ -553,12 +558,12 @@ async def process_pdf(
     try:
         result = generate_outline_with_gemini(pdf_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini API 오류: {e}")
+        raise HTTPException(status_code=502, detail=f"Groq API 오류: {e}")
 
     if result["token_usage"]:
         u = result["token_usage"]
         logger.info(
-            "[Gemini] 입력: %d 토큰 | 출력: %d 토큰 | 총: %d 토큰",
+            "[Groq] 입력: %d 토큰 | 출력: %d 토큰 | 총: %d 토큰",
             u.prompt_token_count,
             u.candidates_token_count,
             u.total_token_count,

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, Fragment } from "react";
 
 const BASE_URL = import.meta.env.VITE_API_URL;
+const JIRA_BASE_URL = import.meta.env.VITE_JIRA_BASE_URL;
 
 const STATUS = { IDLE: "idle", LOADING: "loading", SUCCESS: "success", ERROR: "error" };
 const TAB = { PDF: "pdf", FIGMA: "figma" };
@@ -204,7 +205,7 @@ function SuccessScreen({ result, jiraKey, onReset }) {
           Outline 열기
         </a>
         <a
-          href={`${import.meta.env.VITE_JIRA_BASE_URL}/browse/${jiraKey}`}
+          href={`${JIRA_BASE_URL}/browse/${jiraKey}`}
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center justify-center gap-2 rounded-xl bg-white border border-gray-200
@@ -380,7 +381,7 @@ export default function App() {
               <div className="mb-6 text-center">
                 <h1 className="text-3xl font-bold text-gray-900 tracking-tight">PDF to Outline</h1>
                 <p className="mt-1 text-xs text-gray-400">
-                  문서를 업로드하면 Outline 문서를 생성하고 Jira 이슈에 링크를 등록합니다.
+                  문서를 업로드하면 Outline 문서를 생성하고 <br></br>Jira 이슈에 링크를 등록합니다.
                 </p>
               </div>
             )}

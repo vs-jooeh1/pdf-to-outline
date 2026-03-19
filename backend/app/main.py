@@ -217,7 +217,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def generate_outline_with_gemini(pdf_text: str) -> dict:
     """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")
     prompt = (
         "아래 PDF 내용을 분석하여 개발자가 바로 이해할 수 있는 한국어 문서를 작성해 주세요.\n"
         "불필요한 내용은 제거하고 핵심만 명확하게 정리하세요.\n\n"

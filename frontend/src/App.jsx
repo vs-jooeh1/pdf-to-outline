@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, Fragment } from "react";
 
-const BASE_URL = "http://127.0.0.1:8000";
+const BASE_URL = import.meta.env.VITE_API_URL;
 
 const STATUS = { IDLE: "idle", LOADING: "loading", SUCCESS: "success", ERROR: "error" };
 const TAB = { PDF: "pdf", FIGMA: "figma" };
@@ -252,7 +252,7 @@ export default function App() {
   const fileInputRef = useRef(null);
 
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/collections")
+    fetch(`${BASE_URL}/collections`)
       .then((r) => r.json())
       .then((data) => {
         if (Array.isArray(data)) {
@@ -298,7 +298,7 @@ export default function App() {
         formData.append("file", file);
         formData.append("jira_issue_key", jiraKey.trim());
         if (collectionId) formData.append("collection_id", collectionId);
-        res = await fetch(`${BASE_URL}/process-mock`, { method: "POST", body: formData });
+        res = await fetch(`${BASE_URL}/process`, { method: "POST", body: formData });
       } else {
         res = await fetch(`${BASE_URL}/process-figma`, {
           method: "POST",

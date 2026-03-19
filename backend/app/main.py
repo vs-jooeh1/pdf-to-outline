@@ -1,11 +1,47 @@
 import io
 import re
+import json
 import base64
 import logging
+import threading
+from datetime import date
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Token Usage Persistence
+# ---------------------------------------------------------------------------
+
+TOKEN_USAGE_FILE = Path(__file__).parent.parent / "token_usage.json"
+DAILY_LIMIT = 1_500_000  # Gemini 무료 플랜 일일 한도
+_token_lock = threading.Lock()
+
+
+def _load_token_usage() -> dict:
+    if TOKEN_USAGE_FILE.exists():
+        try:
+            return json.loads(TOKEN_USAGE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_token_usage(data: dict) -> None:
+    TOKEN_USAGE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def record_token_usage(total_tokens: int) -> None:
+    """오늘 날짜의 누적 토큰 사용량을 token_usage.json에 기록합니다."""
+    today = date.today().isoformat()
+    with _token_lock:
+        data = _load_token_usage()
+        day = data.setdefault(today, {"total_requests": 0, "total_tokens": 0})
+        day["total_requests"] += 1
+        day["total_tokens"] += total_tokens
+        _save_token_usage(data)
 
 import pdfplumber
 import google.generativeai as genai
@@ -76,6 +112,15 @@ class TokenUsage(BaseModel):
     prompt_token_count: int
     candidates_token_count: int
     total_token_count: int
+
+
+class TokenUsageResponse(BaseModel):
+    date: str
+    today_requests: int
+    today_tokens: int
+    today_limit_percent: float  # 일일 한도 대비 %
+    total_requests: int         # 전체 누적
+    total_tokens: int           # 전체 누적
 
 
 class ProcessResponse(BaseModel):
@@ -172,7 +217,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def generate_outline_with_gemini(pdf_text: str) -> dict:
     """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash")
     prompt = (
         "아래 PDF 내용을 분석하여 개발자가 바로 이해할 수 있는 한국어 문서를 작성해 주세요.\n"
         "불필요한 내용은 제거하고 핵심만 명확하게 정리하세요.\n\n"
@@ -331,6 +376,28 @@ def health_check():
     return {"status": "ok", "version": app.version}
 
 
+@app.get("/token-usage", response_model=TokenUsageResponse, tags=["Health"])
+def get_token_usage():
+    """날짜별 누적 토큰 사용량을 반환합니다."""
+    today = date.today().isoformat()
+    data = _load_token_usage()
+
+    today_data = data.get(today, {"total_requests": 0, "total_tokens": 0})
+    today_tokens = today_data["total_tokens"]
+
+    all_requests = sum(v["total_requests"] for v in data.values())
+    all_tokens = sum(v["total_tokens"] for v in data.values())
+
+    return TokenUsageResponse(
+        date=today,
+        today_requests=today_data["total_requests"],
+        today_tokens=today_tokens,
+        today_limit_percent=round(today_tokens / DAILY_LIMIT * 100, 2),
+        total_requests=all_requests,
+        total_tokens=all_tokens,
+    )
+
+
 @app.get("/collections", response_model=list[CollectionItem], tags=["Outline"])
 async def get_collections():
     """Outline의 컬렉션 목록을 반환합니다."""
@@ -471,6 +538,7 @@ async def process_pdf(
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드할 수 있습니다.")
 
     file_bytes = await file.read()
+    logger.info("[PDF] 파일명: %s | 크기: %.1f KB", file.filename, len(file_bytes) / 1024)
 
     # 1. PDF 텍스트 추출
     try:
@@ -486,6 +554,16 @@ async def process_pdf(
         result = generate_outline_with_gemini(pdf_text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Gemini API 오류: {e}")
+
+    if result["token_usage"]:
+        u = result["token_usage"]
+        logger.info(
+            "[Gemini] 입력: %d 토큰 | 출력: %d 토큰 | 총: %d 토큰",
+            u.prompt_token_count,
+            u.candidates_token_count,
+            u.total_token_count,
+        )
+        record_token_usage(u.total_token_count)
 
     # 3. Outline 문서 생성
     document_url = await create_outline_document(result["title"], result["markdown"])

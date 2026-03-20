@@ -383,11 +383,19 @@ def _build_adf_body(message: str, title: str, url: str) -> dict:
 async def _post_jira_comment(issue_key: str, body: str, title: str = "", url: str = "") -> str:
     """Posts a comment to a Jira issue in ADF format and returns the comment ID."""
     adf_body = _build_adf_body(body, title, url)
-    jira_url = f"{settings.jira_base_url}/rest/api/3/issue/{issue_key}/comment"
+    base = settings.jira_base_url.rstrip("/")
+    jira_url = f"{base}/rest/api/3/issue/{issue_key}/comment"
+    payload = {"body": adf_body}
+    headers = _jira_auth_headers()
+
+    logger.info("[Jira] POST %s", jira_url)
+    logger.info("[Jira] payload: %s", json.dumps(payload, ensure_ascii=False))
+
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            jira_url, json={"body": adf_body}, headers=_jira_auth_headers(), timeout=30
-        )
+        resp = await client.post(jira_url, json=payload, headers=headers, timeout=30)
+
+    logger.info("[Jira] 응답 status: %d | body: %s", resp.status_code, resp.text[:500])
+
     if resp.status_code not in (200, 201):
         raise HTTPException(status_code=502, detail=f"Jira API error: {resp.text}")
     return resp.json()["id"]

@@ -44,7 +44,7 @@ def record_token_usage(total_tokens: int) -> None:
         _save_token_usage(data)
 
 import pdfplumber
-# import google.generativeai as genai
+import google.generativeai as genai
 from groq import Groq
 import httpx
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -58,7 +58,7 @@ from pydantic_settings import BaseSettings
 # ---------------------------------------------------------------------------
 
 class Settings(BaseSettings):
-    # gemini_api_key: str
+    gemini_api_key: str | None = None
     groq_api_key: str
     outline_api_url: str
     outline_api_key: str
@@ -75,7 +75,14 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# genai.configure(api_key=settings.gemini_api_key)
+gemini_model = None
+if settings.gemini_api_key:
+    genai.configure(api_key=settings.gemini_api_key)
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    logger.info("[LLM] Gemini 활성화: gemini-2.0-flash")
+else:
+    logger.info("[LLM] GEMINI_API_KEY 미설정 → Groq 전용 모드")
+
 groq_client = Groq(api_key=settings.groq_api_key)
 
 
@@ -131,6 +138,7 @@ class ProcessResponse(BaseModel):
     jira_comment_id: str
     title: str
     token_usage: TokenUsage | None = None
+    model_used: str | None = None
 
 
 class CollectionItem(BaseModel):
@@ -218,8 +226,19 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(pages)
 
 
-def generate_outline_with_gemini(pdf_text: str) -> dict:
-    """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage}"""
+def _parse_title_body(raw: str) -> tuple[str, str]:
+    """TITLE: 접두사를 파싱해 (title, body) 튜플을 반환합니다."""
+    if raw.startswith("TITLE:"):
+        first_line, _, rest = raw.partition("\n")
+        return first_line.removeprefix("TITLE:").strip(), rest.strip()
+    return "Untitled Document", raw
+
+
+def generate_outline(text: str) -> dict:
+    """Returns {"title": ..., "markdown": ..., "token_usage": TokenUsage, "model_used": str}
+    Gemini API key가 설정되어 있으면 Gemini를 먼저 시도하고,
+    실패(quota 초과·인증 오류 등)하면 Groq으로 폴백합니다.
+    """
     prompt = (
         "아래 PDF 내용을 분석하여 개발자가 바로 이해할 수 있는 한국어 문서를 작성해 주세요.\n"
         "불필요한 내용은 제거하고 핵심만 명확하게 정리하세요.\n\n"
@@ -232,22 +251,40 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
         "## 참고사항\n"
         "<기타 메모, 제약사항, 주의할 점 등 — 없으면 이 섹션은 생략>\n\n"
         "---\n"
-        f"{pdf_text[:12000]}"
+        f"{text[:12000]}"
     )
+
+    # ── Gemini 시도 ──────────────────────────────────────────────────────────
+    if gemini_model:
+        try:
+            response = gemini_model.generate_content(prompt)
+            raw = response.text.strip()
+            title, body = _parse_title_body(raw)
+
+            usage = response.usage_metadata
+            token_usage = TokenUsage(
+                prompt_token_count=usage.prompt_token_count,
+                candidates_token_count=usage.candidates_token_count,
+                total_token_count=usage.total_token_count,
+            )
+            logger.info(
+                "[Gemini] prompt: %d | candidates: %d | total: %d",
+                token_usage.prompt_token_count,
+                token_usage.candidates_token_count,
+                token_usage.total_token_count,
+            )
+            return {"title": title, "markdown": body, "token_usage": token_usage, "model_used": "gemini-2.0-flash"}
+        except Exception as e:
+            logger.warning("[Gemini] 실패 → Groq 폴백: %s", e)
+
+    # ── Groq 폴백 ────────────────────────────────────────────────────────────
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
     )
     raw = response.choices[0].message.content.strip()
+    title, body = _parse_title_body(raw)
 
-    title = "Untitled Document"
-    body = raw
-    if raw.startswith("TITLE:"):
-        first_line, _, rest = raw.partition("\n")
-        title = first_line.removeprefix("TITLE:").strip()
-        body = rest.strip()
-
-    # 토큰 사용량 추출 및 로깅
     usage = response.usage
     token_usage = TokenUsage(
         prompt_token_count=usage.prompt_tokens,
@@ -255,13 +292,12 @@ def generate_outline_with_gemini(pdf_text: str) -> dict:
         total_token_count=usage.total_tokens,
     )
     logger.info(
-        "Groq token usage — prompt: %d, candidates: %d, total: %d",
+        "[Groq] prompt: %d | candidates: %d | total: %d",
         token_usage.prompt_token_count,
         token_usage.candidates_token_count,
         token_usage.total_token_count,
     )
-
-    return {"title": title, "markdown": body, "token_usage": token_usage}
+    return {"title": title, "markdown": body, "token_usage": token_usage, "model_used": "groq/llama-3.3-70b-versatile"}
 
 
 async def create_outline_document(title: str, markdown: str, collection_id: str | None = None) -> str:
@@ -450,11 +486,11 @@ async def process_figma(req: FigmaProcessRequest):
     if not figma_text.strip():
         raise HTTPException(status_code=422, detail="Figma 파일에서 텍스트를 추출할 수 없습니다.")
 
-    # 4. Gemini로 Outline 마크다운 생성
+    # 4. LLM으로 Outline 마크다운 생성 (Gemini 우선, 실패 시 Groq 폴백)
     try:
-        result = generate_outline_with_gemini(figma_text)
+        result = generate_outline(figma_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Groq API 오류: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM API 오류: {e}")
 
     # 5. Outline 문서 생성
     document_url = await create_outline_document(result["title"], result["markdown"], req.collection_id)
@@ -470,6 +506,7 @@ async def process_figma(req: FigmaProcessRequest):
         jira_comment_id=comment_id,
         title=result["title"],
         token_usage=result["token_usage"],
+        model_used=result.get("model_used"),
     )
 
 
@@ -555,21 +592,15 @@ async def process_pdf(
     if not pdf_text.strip():
         raise HTTPException(status_code=422, detail="PDF에서 텍스트를 추출할 수 없습니다.")
 
-    # 2. Gemini로 Outline 생성
+    # 2. LLM으로 Outline 생성 (Gemini 우선, 실패 시 Groq 폴백)
     try:
-        result = generate_outline_with_gemini(pdf_text)
+        result = generate_outline(pdf_text)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Groq API 오류: {e}")
+        raise HTTPException(status_code=502, detail=f"LLM API 오류: {e}")
 
+    logger.info("[LLM] 사용 모델: %s", result.get("model_used"))
     if result["token_usage"]:
-        u = result["token_usage"]
-        logger.info(
-            "[Groq] 입력: %d 토큰 | 출력: %d 토큰 | 총: %d 토큰",
-            u.prompt_token_count,
-            u.candidates_token_count,
-            u.total_token_count,
-        )
-        record_token_usage(u.total_token_count)
+        record_token_usage(result["token_usage"].total_token_count)
 
     # 3. Outline 문서 생성
     document_url = await create_outline_document(result["title"], result["markdown"], collection_id)
@@ -582,4 +613,5 @@ async def process_pdf(
         jira_comment_id=comment_id,
         title=result["title"],
         token_usage=result["token_usage"],
+        model_used=result.get("model_used"),
     )
